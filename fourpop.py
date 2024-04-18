@@ -4,15 +4,18 @@ from scipy import optimize
 import matplotlib
 
 class fourpop():
-    def __init__(self, GRIK4: float, D2: float,  p: dict = None):
+    def __init__(self, GRIK4: float, D2: iter,  custom_args:dict = None, p: dict = None):
         # Parameters
         if p != None:
-            print("Using custom parameters")
+            # print("Using custom parameters")
             self.p = p
         else:
-            print("No parameter dict given. Creating model with default parameters")
+            # print("No parameter dict given. Creating model with default parameters")
             default_params = self.default_params()
             self.p = default_params
+
+        if custom_args:
+            self.p.update(custom_args)
             
         # set important attr from params
         self.NT = int(self.p['T']/self.p['dt'])
@@ -20,7 +23,10 @@ class fourpop():
         self.timerange = np.linspace(0, self.p['T'], self.NT)
         self.GRIK4 = GRIK4
         self.D2 = D2
-        
+
+        # Create the D2 and GRIK4 arrays
+        self.I_GRIK = np.array([0, 0, self.GRIK4*self.p['JGRIKPV'], self.GRIK4*self.p['JGRIKPV']])
+                
         # create background current array (since this comes up a lot)
         self.I0 = np.array([self.p['I0E'], self.p['I0E'], self.p['I0I'], self.p['I0I']])
 
@@ -53,6 +59,14 @@ class fourpop():
         p['mu'] = 40
         p['coh'] = 0
 
+        p['betaSOM'] = 90
+        p['I_SOM_rh'] = 0.04    # nA rheobase SOM
+        p['I_SOM_bg'] = 0.15    # baseline SOM input current
+
+        p['JVIP'] = -0.001    # VIP to SOM
+        p['JSOM'] = -0.0002  # SOM to Exc
+        p['JGRIKPV']  = 0.001
+
         p['gamma'] = 0.641   # firing rate to NMDA activation multiplier
 
         p['JNE'] = 0.42345756
@@ -74,10 +88,6 @@ class fourpop():
 
         return p
     
-    def update(self, **kwargs):
-        # Update existing parameters
-        self.p.update(kwargs)
-
     def adjacency(self):
         # calculate and return the input matrix
         p = self.p
@@ -123,6 +133,10 @@ class fourpop():
         S[2:4, 0] = (np.random.rand(2)*0.05 + 0.275)
         
         r = np.zeros((4, NT))
+
+        # firing rates for interneurons involved in disinhibition
+        # 0 VIP1; 1 VIP2; 2 SOM1; 3 SOM2;
+        r_vs = np.zeros((4, NT))
         
         for t, time in enumerate(self.timerange): #Loop through time for a trial
 
@@ -131,13 +145,16 @@ class fourpop():
             Istim2 = ((self.p['Tstim']/dt < t) & (t<(self.p['Tstim']+self.p['Tdur'])/dt)) * (self.p['Jampa_ext']*self.p['mu']*(1-self.p['coh']/100)) # To population 2
             Istim = np.array([Istim1, Istim2, 0., 0.])
 
-            I0 = np.array([self.p['I0E'], self.p['I0E'], self.p['I0I'], self.p['I0I']])
-            
-            GRIK = np.array([0, 0, self.GRIK4*0.01, self.GRIK4*0.01])
+            # Interneuron output
+            r_vs[0:2,t] = 5 * self.D2
+            rate_SOM = self.p['betaSOM']*(self.p['JVIP']*r_vs[0:2, t] - self.p['I_SOM_rh'] + self.p['I_SOM_bg'])
+            r_vs[2:4,t] = np.where(rate_SOM<0, 0, rate_SOM)
+            I_SOM = np.zeros(4)
+            I_SOM[0:2] = self.p['JSOM'] * r_vs[2:4, t]
 
             # Total synaptic input
             s_array = S[:,t]
-            I = np.matmul(A, s_array) + I0 + Istim + GRIK + Ieta[:,t]
+            I = np.matmul(A, s_array) + self.I0 + Istim + self.I_GRIK + I_SOM + Ieta[:,t]
 
             # Transfer function to get firing rate
             r[0:2, t] = F(I[0:2], self.p['aE'], self.p['bE'], self.p['dE'])
@@ -152,24 +169,30 @@ class fourpop():
             # Ornstein-Uhlenbeck generation of noise in pop1 and 2
             Ieta[:, t+1] = Ieta[:,t] + (dt/self.p['tauA']) * (-Ieta[:,t]) + np.sqrt(self.p['tauA'])*self.p['sigma']*gwn[:,t]
 
-        return {'r': r, 'S': S,
+        return {'r': r, 'S': S, 'rvs': r_vs,
                 't':self.timerange}
     
     def dsdt(self, s, ifstim=True):
         I_stim = np.zeros([4])
         x      = np.zeros([4])
+        r_vs    = np.zeros([4])
         H      = np.zeros([4])
         dS     = np.zeros([4])
-
-        GRIK = np.array([0, 0, self.GRIK4*0.01, self.GRIK4*0.01])
 
         # stim
         if ifstim:
             I_stim[0] = self.p['Jampa_ext'] * self.p['mu'] * (1+self.p['coh']/100) 
             I_stim[1] = self.p['Jampa_ext'] * self.p['mu'] * (1-self.p['coh']/100)
 
+        # Interneuron output
+        r_vs[0:2] = 5 * self.D2
+        rate_SOM = self.p['betaSOM']*(self.p['JVIP']*r_vs[0:2] - self.p['I_SOM_rh'] + self.p['I_SOM_bg'])
+        r_vs[2:4] = np.where(rate_SOM<0, 0, rate_SOM)
+        I_SOM = np.zeros(4)
+        I_SOM[0:2] = self.p['JSOM'] * r_vs[2:4]
+
         # input
-        x[:] = np.matmul(self.A,s) + self.I0 + I_stim + GRIK
+        x[:] = np.matmul(self.A,s) + self.I0 + I_stim + self.I_GRIK + I_SOM
 
         # freq
         H[0:2]  = (self.p['aE']*x[0:2] - self.p['bE'])/(1 - np.exp(-self.p['dE']*(self.p['aE']*x[0:2] - self.p['bE']))) 
@@ -191,21 +214,28 @@ class fourpop():
         dI = self.p['dI']
 
         taus = np.array([self.p['tauN'], self.p['tauN'], self.p['tauG'], self.p['tauG']])
-        GRIK = np.array([0, 0, self.GRIK4*0.01, self.GRIK4*0.01])
 
         I_stim = np.zeros([4])
         H      = np.zeros([4])
-        
+        r_vs   = np.zeros([4])
+
         dHds   = np.zeros([4,4])
         dsds   = np.zeros([4,4])
-        
+
+        # Interneuron output
+        r_vs[0:2] = 5 * self.D2
+        rate_SOM = self.p['betaSOM']*(self.p['JVIP']*r_vs[0:2] - self.p['I_SOM_rh'] + self.p['I_SOM_bg'])
+        r_vs[2:4] = np.where(rate_SOM<0, 0, rate_SOM)
+        I_SOM = np.zeros(4)
+        I_SOM[0:2] = self.p['JSOM'] * r_vs[2:4]
+
         if ifstim:
             I_stim[0] = self.p['Jampa_ext'] * self.p['mu'] * (1+self.p['coh']/100) 
             I_stim[1] = self.p['Jampa_ext'] * self.p['mu'] * (1-self.p['coh']/100)
 
         dxds = self.A
 
-        x = np.matmul(self.A,S) + self.I0 + I_stim + GRIK
+        x = np.matmul(self.A,S) + self.I0 + I_stim + self.I_GRIK + I_SOM
         H[0:2] = (aE*x[0:2] - bE)/(1 - np.exp(-dE*(aE*x[0:2] - bE))) 
         H[2:4] = (aI*x[2:4] - bI)/(1 - np.exp(-dI*(aI*x[2:4] - bI)))
 
